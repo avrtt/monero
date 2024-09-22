@@ -46,19 +46,19 @@ int main(int argc, char* argv[])
   TRY_ENTRY();
 
   epee::string_tools::set_module_name_and_folder(argv[0]);
-
-  uint32_t log_level = 0;
-
   tools::on_startup();
 
+  uint32_t log_level = 0;
   boost::filesystem::path output_file_path;
 
+  // Command line arguments definition
   po::options_description desc_cmd_only("Command line options");
   po::options_description desc_cmd_sett("Command line options and settings options");
-  const command_line::arg_descriptor<std::string> arg_log_level  = {"log-level",  "0-4 or categories", ""};
-  const command_line::arg_descriptor<std::string> arg_txid  = {"txid", "Get min depth for this txid", ""};
-  const command_line::arg_descriptor<uint64_t> arg_height  = {"height", "Get min depth for all txes at this height", 0};
-  const command_line::arg_descriptor<bool> arg_include_coinbase  = {"include-coinbase", "Include coinbase in the average", false};
+
+  const command_line::arg_descriptor<std::string> arg_log_level{"log-level", "0-4 or categories", ""};
+  const command_line::arg_descriptor<std::string> arg_txid{"txid", "Get min depth for this txid", ""};
+  const command_line::arg_descriptor<uint64_t> arg_height{"height", "Get min depth for all txes at this height", 0};
+  const command_line::arg_descriptor<bool> arg_include_coinbase{"include-coinbase", "Include coinbase in the average", false};
 
   command_line::add_arg(desc_cmd_sett, cryptonote::arg_data_dir);
   command_line::add_arg(desc_cmd_sett, cryptonote::arg_testnet_on);
@@ -73,247 +73,203 @@ int main(int argc, char* argv[])
   desc_options.add(desc_cmd_only).add(desc_cmd_sett);
 
   po::variables_map vm;
-  bool r = command_line::handle_error_helper(desc_options, [&]()
-  {
+  bool parse_success = command_line::handle_error_helper(desc_options, [&]() {
     auto parser = po::command_line_parser(argc, argv).options(desc_options);
     po::store(parser.run(), vm);
     po::notify(vm);
     return true;
   });
-  if (! r)
-    return 1;
 
-  if (command_line::get_arg(vm, command_line::arg_help))
-  {
-    std::cout << "Monero '" << MONERO_RELEASE_NAME << "' (v" << MONERO_VERSION_FULL << ")" << ENDL << ENDL;
+  if (!parse_success) return 1;
+
+  if (command_line::get_arg(vm, command_line::arg_help)) {
+    std::cout << "Monero '" << MONERO_RELEASE_NAME << "' (v" << MONERO_VERSION_FULL << ")" << std::endl;
     std::cout << desc_options << std::endl;
     return 1;
   }
 
   mlog_configure(mlog_get_default_log_path("monero-blockchain-depth.log"), true);
+
   if (!command_line::is_arg_defaulted(vm, arg_log_level))
     mlog_set_log(command_line::get_arg(vm, arg_log_level).c_str());
   else
-    mlog_set_log(std::string(std::to_string(log_level) + ",bcutil:INFO").c_str());
+    mlog_set_log((std::to_string(log_level) + ",bcutil:INFO").c_str());
 
   LOG_PRINT_L0("Starting...");
 
-  std::string opt_data_dir = command_line::get_arg(vm, cryptonote::arg_data_dir);
+  // Get program options
+  auto opt_data_dir = command_line::get_arg(vm, cryptonote::arg_data_dir);
   bool opt_testnet = command_line::get_arg(vm, cryptonote::arg_testnet_on);
   bool opt_stagenet = command_line::get_arg(vm, cryptonote::arg_stagenet_on);
-  network_type net_type = opt_testnet ? TESTNET : opt_stagenet ? STAGENET : MAINNET;
-  std::string opt_txid_string = command_line::get_arg(vm, arg_txid);
+  network_type net_type = opt_testnet ? TESTNET : (opt_stagenet ? STAGENET : MAINNET);
+
+  auto opt_txid_string = command_line::get_arg(vm, arg_txid);
   uint64_t opt_height = command_line::get_arg(vm, arg_height);
   bool opt_include_coinbase = command_line::get_arg(vm, arg_include_coinbase);
 
-  if (!opt_txid_string.empty() && opt_height)
-  {
+  if (!opt_txid_string.empty() && opt_height) {
     std::cerr << "txid and height cannot be given at the same time" << std::endl;
     return 1;
   }
+
   crypto::hash opt_txid = crypto::null_hash;
-  if (!opt_txid_string.empty())
-  {
-    if (!epee::string_tools::hex_to_pod(opt_txid_string, opt_txid))
-    {
-      std::cerr << "Invalid txid" << std::endl;
-      return 1;
-    }
+  if (!opt_txid_string.empty() && !epee::string_tools::hex_to_pod(opt_txid_string, opt_txid)) {
+    std::cerr << "Invalid txid" << std::endl;
+    return 1;
   }
 
-  // If we wanted to use the memory pool, we would set up a fake_core.
-
-  // Use Blockchain instead of lower-level BlockchainDB for two reasons:
-  // 1. Blockchain has the init() method for easy setup
-  // 2. exporter needs to use get_current_blockchain_height(), get_block_id_by_height(), get_block_by_hash()
+  // Blockchain initialization
   LOG_PRINT_L0("Initializing source blockchain (BlockchainDB)");
-  std::unique_ptr<BlockchainAndPool> core_storage = std::make_unique<BlockchainAndPool>();
-  BlockchainDB *db = new_db();
-  if (db == NULL)
-  {
+
+  auto core_storage = std::make_unique<BlockchainAndPool>();
+  std::unique_ptr<BlockchainDB> db(new_db());
+
+  if (!db) {
     LOG_ERROR("Failed to initialize a database");
     throw std::runtime_error("Failed to initialize a database");
   }
+
   LOG_PRINT_L0("database: LMDB");
 
   const std::string filename = (boost::filesystem::path(opt_data_dir) / db->get_db_name()).string();
   LOG_PRINT_L0("Loading blockchain from folder " << filename << " ...");
 
-  try
-  {
+  try {
     db->open(filename, DBF_RDONLY);
-  }
-  catch (const std::exception& e)
-  {
+  } catch (const std::exception& e) {
     LOG_PRINT_L0("Error opening database: " << e.what());
     return 1;
   }
-  r = core_storage->blockchain.init(db, net_type);
 
-  CHECK_AND_ASSERT_MES(r, 1, "Failed to initialize source blockchain storage");
+  if (!core_storage->blockchain.init(db.get(), net_type)) {
+    LOG_PRINT_L0("Failed to initialize source blockchain storage");
+    return 1;
+  }
+
   LOG_PRINT_L0("Source blockchain storage initialized OK");
 
+  // Gather transactions to check
   std::vector<crypto::hash> start_txids;
-  if (!opt_txid_string.empty())
-  {
+  if (!opt_txid_string.empty()) {
     start_txids.push_back(opt_txid);
-  }
-  else
-  {
-    const cryptonote::blobdata bd = db->get_block_blob_from_height(opt_height);
+  } else {
+    auto bd = db->get_block_blob_from_height(opt_height);
     cryptonote::block b;
-    if (!cryptonote::parse_and_validate_block_from_blob(bd, b))
-    {
+
+    if (!cryptonote::parse_and_validate_block_from_blob(bd, b)) {
       LOG_PRINT_L0("Bad block from db");
       return 1;
     }
-    for (const crypto::hash &txid: b.tx_hashes)
-      start_txids.push_back(txid);
-    if (opt_include_coinbase)
-      start_txids.push_back(cryptonote::get_transaction_hash(b.miner_tx));
+
+    for (const auto& txid : b.tx_hashes) start_txids.push_back(txid);
+    if (opt_include_coinbase) start_txids.push_back(cryptonote::get_transaction_hash(b.miner_tx));
   }
 
-  if (start_txids.empty())
-  {
+  if (start_txids.empty()) {
     LOG_PRINT_L0("No transaction(s) to check");
     return 1;
   }
 
+  // Calculate depth for transactions
   std::vector<uint64_t> depths;
-  for (const crypto::hash &start_txid: start_txids)
-  {
+
+  for (const auto& start_txid : start_txids) {
     uint64_t depth = 0;
     bool coinbase = false;
+    std::vector<crypto::hash> txids{start_txid};
 
-    LOG_PRINT_L0("Checking depth for txid " << start_txid);
-    std::vector<crypto::hash> txids(1, start_txid);
-    while (!coinbase)
-    {
-      LOG_PRINT_L0("Considering "<< txids.size() << " transaction(s) at depth " << depth);
+    while (!coinbase) {
+      LOG_PRINT_L0("Considering " << txids.size() << " transaction(s) at depth " << depth);
+
       std::vector<crypto::hash> new_txids;
-      for (const crypto::hash &txid: txids)
-      {
+
+      for (const auto& txid : txids) {
         cryptonote::blobdata bd;
-        if (!db->get_pruned_tx_blob(txid, bd))
-        {
+
+        if (!db->get_pruned_tx_blob(txid, bd)) {
           LOG_PRINT_L0("Failed to get txid " << txid << " from db");
           return 1;
         }
+
         cryptonote::transaction tx;
-        if (!cryptonote::parse_and_validate_tx_base_from_blob(bd, tx))
-        {
+
+        if (!cryptonote::parse_and_validate_tx_base_from_blob(bd, tx)) {
           LOG_PRINT_L0("Bad tx: " << txid);
           return 1;
         }
-        for (size_t ring = 0; ring < tx.vin.size(); ++ring)
-        {
-          if (tx.vin[ring].type() == typeid(cryptonote::txin_gen))
-          {
-            MDEBUG(txid << " is a coinbase transaction");
+
+        for (const auto& vin : tx.vin) {
+          if (vin.type() == typeid(cryptonote::txin_gen)) {
             coinbase = true;
-            goto done;
-          }
-          if (tx.vin[ring].type() == typeid(cryptonote::txin_to_key))
-          {
-            const cryptonote::txin_to_key &txin = boost::get<cryptonote::txin_to_key>(tx.vin[ring]);
-            const uint64_t amount = txin.amount;
-            auto absolute_offsets = cryptonote::relative_output_offsets_to_absolute(txin.key_offsets);
-            for (uint64_t offset: absolute_offsets)
-            {
-              const output_data_t od = db->get_output_key(amount, offset);
-              const crypto::hash block_hash = db->get_block_hash_from_height(od.height);
+            break;
+          } else if (vin.type() == typeid(cryptonote::txin_to_key)) {
+            const auto& txin = boost::get<cryptonote::txin_to_key>(vin);
+            const auto absolute_offsets = cryptonote::relative_output_offsets_to_absolute(txin.key_offsets);
+
+            for (uint64_t offset : absolute_offsets) {
+              auto od = db->get_output_key(txin.amount, offset);
+              auto block_hash = db->get_block_hash_from_height(od.height);
+
               bd = db->get_block_blob(block_hash);
               cryptonote::block b;
-              if (!cryptonote::parse_and_validate_block_from_blob(bd, b))
-              {
+
+              if (!cryptonote::parse_and_validate_block_from_blob(bd, b)) {
                 LOG_PRINT_L0("Bad block from db");
                 return 1;
               }
-              // find the tx which created this output
-              bool found = false;
-              for (size_t out = 0; out < b.miner_tx.vout.size(); ++out)
-              {
-                if (b.miner_tx.vout[out].target.type() == typeid(cryptonote::txout_to_key))
-                {
-                  const auto &txout = boost::get<cryptonote::txout_to_key>(b.miner_tx.vout[out].target);
-                  if (txout.key == od.pubkey)
-                  {
-                    found = true;
-                    new_txids.push_back(cryptonote::get_transaction_hash(b.miner_tx));
-                    MDEBUG("adding txid: " << cryptonote::get_transaction_hash(b.miner_tx));
-                    break;
-                  }
+
+              auto match_txout_key = [&](const auto& txout, const crypto::hash& tx_hash) {
+                if (boost::get<cryptonote::txout_to_key>(txout.target).key == od.pubkey) {
+                  new_txids.push_back(tx_hash);
+                  return true;
                 }
-                else
-                {
-                  LOG_PRINT_L0("Bad vout type in txid " << cryptonote::get_transaction_hash(b.miner_tx));
-                  return 1;
-                }
-              }
-              for (const crypto::hash &block_txid: b.tx_hashes)
-              {
-                if (found)
-                  break;
-                if (!db->get_pruned_tx_blob(block_txid, bd))
-                {
+                return false;
+              };
+
+              if (std::any_of(b.miner_tx.vout.begin(), b.miner_tx.vout.end(), [&](const auto& vout) {
+                    return match_txout_key(vout, cryptonote::get_transaction_hash(b.miner_tx));
+                  }))
+                break;
+
+              for (const auto& block_txid : b.tx_hashes) {
+                if (!db->get_pruned_tx_blob(block_txid, bd)) {
                   LOG_PRINT_L0("Failed to get txid " << block_txid << " from db");
                   return 1;
                 }
+
                 cryptonote::transaction tx2;
-                if (!cryptonote::parse_and_validate_tx_base_from_blob(bd, tx2))
-                {
+
+                if (!cryptonote::parse_and_validate_tx_base_from_blob(bd, tx2)) {
                   LOG_PRINT_L0("Bad tx: " << block_txid);
                   return 1;
                 }
-                for (size_t out = 0; out < tx2.vout.size(); ++out)
-                {
-                  if (tx2.vout[out].target.type() == typeid(cryptonote::txout_to_key))
-                  {
-                    const auto &txout = boost::get<cryptonote::txout_to_key>(tx2.vout[out].target);
-                    if (txout.key == od.pubkey)
-                    {
-                      found = true;
-                      new_txids.push_back(block_txid);
-                      MDEBUG("adding txid: " << block_txid);
-                      break;
-                    }
-                  }
-                  else
-                  {
-                    LOG_PRINT_L0("Bad vout type in txid " << block_txid);
-                    return 1;
-                  }
-                }
-              }
-              if (!found)
-              {
-                LOG_PRINT_L0("Output originating transaction not found");
-                return 1;
+
+                if (std::any_of(tx2.vout.begin(), tx2.vout.end(), [&](const auto& vout) {
+                      return match_txout_key(vout, block_txid);
+                    }))
+                  break;
               }
             }
-          }
-          else
-          {
+          } else {
             LOG_PRINT_L0("Bad vin type in txid " << txid);
             return 1;
           }
         }
       }
-      if (!coinbase)
-      {
+
+      if (!coinbase) {
         std::swap(txids, new_txids);
         ++depth;
       }
     }
-done:
+
     LOG_PRINT_L0("Min depth for txid " << start_txid << ": " << depth);
     depths.push_back(depth);
   }
 
-  uint64_t cumulative_depth = 0;
-  for (uint64_t depth: depths)
-    cumulative_depth += depth;
-  LOG_PRINT_L0("Average min depth for " << start_txids.size() << " transaction(s): " << cumulative_depth/(float)depths.size());
+  // Output depth results
+  uint64_t cumulative_depth = std::accumulate(depths.begin(), depths.end(), 0ULL);
+  LOG_PRINT_L0("Average min depth for " << start_txids.size() << " transaction(s): " << cumulative_depth / static_cast<float>(depths.size()));
   LOG_PRINT_L0("Median min depth for " << start_txids.size() << " transaction(s): " << epee::misc_utils::median(depths));
 
   core_storage->blockchain.deinit();
@@ -321,3 +277,4 @@ done:
 
   CATCH_ENTRY("Depth query error", 1);
 }
+
